@@ -49,8 +49,28 @@ cat >"$pkg/bin/.kilo" <<EOF
 case "\${1:-}" in
     --version) printf '%s\\n' "$version" ;;
     --print-ts) printf '%s\\n' "\${KILO_TREE_SITTER_WASM_DIR:-}" ;;
+    profile)
+        printf '%s\\n' "\$*" >>"\${FAKE_KILO_LOG:-/dev/null}"
+        if [ -n "\${FAKE_KILO_LOGGED_OUT_FILE:-}" ] && [ -e "\$FAKE_KILO_LOGGED_OUT_FILE" ]; then
+            printf '%s\\n' 'Error: Not authenticated with Kilo Gateway' >&2
+            exit 1
+        fi
+        printf '%s\\n' 'Name: Test User'
+        printf '%s\\n' 'Email: test@example.com'
+        exit 0
+        ;;
+    auth)
+        printf '%s\\n' "\$*" >>"\${FAKE_KILO_LOG:-/dev/null}"
+        if [ "\${FAKE_KILO_LOGIN_FAIL:-0}" = "1" ]; then
+            printf '%s\\n' 'Error: login canceled' >&2
+            exit 1
+        fi
+        rm -f "\${FAKE_KILO_LOGGED_OUT_FILE:-/dev/null/nonexistent}"
+        printf '%s\\n' 'Go to: https://example.invalid/device-auth?code=ABCD-1234'
+        exit 0
+        ;;
 esac
-exit ${FAKE_NPM_BAD_BINARY:-0}
+exit \${FAKE_NPM_BAD_BINARY:-0}
 EOF
 chmod 755 "$pkg/bin/.kilo"
 

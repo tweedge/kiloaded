@@ -8,16 +8,16 @@ All prose in markdown files (README.md, AGENTS.md) uses **soft wrapping**: one p
 
 ## What this repository is
 
-`kiloaded` is a small Linux-only wrapper that installs the Kilo CLI from its official npm package and runs `kilo serve` as a systemd **user** service. It is deliberately a one-script manager, not a package manager and not a system service installer. The inspiration is the systemd-managed `kilo console` feature request in Kilo-Org/kilocode#11865, updated for the current CLI: `kilo console` is deprecated, so the background service runs the headless `kilo serve` command instead.
+`kiloaded` is a small Linux-only wrapper that installs the Kilo CLI from its official npm package and runs `kilo serve` as a systemd **user** service, registered with Kilo Cloud for remote control. It is deliberately a one-script manager, not a package manager and not a system service installer. The inspiration is the systemd-managed `kilo console` feature request in Kilo-Org/kilocode#11865, updated for the current CLI: `kilo console` is deprecated, so the background service runs the headless `kilo serve` command instead. Remote control (starting Kilo jobs from the phone or another Kilo Cloud surface) is the point of the tool: after every service start the manager registers the server with Kilo Cloud, and `install`/`update` run Kilo's own device-code login when the host is not logged in.
 
-Non-goals: macOS, Windows, non-systemd init systems, system-wide `/etc/systemd/system` units, dedicated service accounts, Docker, and managing Kilo's authentication or settings. If someone asks for one of those, that is a different tool.
+Non-goals: macOS, Windows, non-systemd init systems, system-wide `/etc/systemd/system` units, dedicated service accounts, Docker, editing Kilo's own config or credential files. If someone asks for one of those, that is a different tool.
 
 ## Repository layout
 
-- `kiloaded` — the entire manager: argument parsing, npm install, versioned CLI store, config, unit rendering, lifecycle commands, status, and logs. It must stay a single POSIX `sh` file so `install.sh` can download and run it without a support library.
+- `kiloaded` — the entire manager: argument parsing, npm install, versioned CLI store, config, unit rendering, lifecycle commands, login, remote-control registration, status, and logs. It must stay a single POSIX `sh` file so `install.sh` can download and run it without a support library.
 - `install.sh` — the curl entrypoint. It downloads `kiloaded` into `~/.local/bin` (or `KILOADED_BIN_DIR`) and then runs `kiloaded install` with the caller's arguments.
-- `tests/run.sh` — hermetic end-to-end tests with fake `npm`, `systemctl`, `loginctl`, `journalctl`, `node`, and `uname`. No network, no real systemd, no multi-hundred-MB download.
-- `tests/fakes/` — those test doubles. Keep them strict enough that a regression in the manager fails a test, but do not let them grow into a second implementation.
+- `tests/run.sh` — hermetic end-to-end tests with fake `npm`, `systemctl`, `loginctl`, `journalctl`, `node`, and `uname`. No network, no real systemd, no multi-hundred-MB download. Stdin is `/dev/null` in every test so TTY detection is hermetic.
+- `tests/fakes/` — those test doubles. The fake npm also generates a fake `.kilo` that answers `--version`, `--print-ts`, `profile`, and `auth login` so the login flow is testable. Keep them strict enough that a regression in the manager fails a test, but do not let them grow into a second implementation.
 - `tests/smoke.sh` — the opt-in real test: real npm, real Kilo binary, real `kilo serve` health check, update across versions, remove.
 - `.github/workflows/ci.yml` — syntax, shellcheck, hermetic tests, and a real smoke job on pushes/workflow dispatch.
 - `README.md` — user-facing install and command reference, kept high level.
@@ -42,7 +42,8 @@ The manager honors `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XD
 - `$XDG_DATA_HOME/kiloaded/cli/<version>/` — one npm install per Kilo version.
 - `$XDG_DATA_HOME/kiloaded/cli/current` — a relative symlink to the active version.
 - `$XDG_DATA_HOME/kiloaded/libexec/kilo` — the stable, generated launcher used by the unit and by `~/.local/bin/kilo`.
-- `$XDG_CONFIG_HOME/kiloaded/config` — the saved port and hostname.
+- `$XDG_DATA_HOME/kiloaded/libexec/kilo-remote` — the generated best-effort helper that registers the server with Kilo Cloud (used as the unit's `ExecStartPost`).
+- `$XDG_CONFIG_HOME/kiloaded/config` — the saved port, hostname, and remote-control switch.
 - `$XDG_CONFIG_HOME/systemd/user/kiloaded.service` — the unit.
 
 Kilo's own settings and credentials live under `~/.config/kilo` and `~/.local/share/kilo` (or the corresponding XDG overrides). Never write there during install, update, or remove. `remove` preserves those directories on purpose. The manager's own config file is plain `KEY=value` text parsed line-by-line, never sourced; malformed values are ignored with a warning so `install` can rewrite a clean config instead of dying on a hand-mangled file.
@@ -65,7 +66,7 @@ Do not put `KILO_TREE_SITTER_WASM_DIR` in the unit: the wrapper is the single pl
 
 ### Unit rendering
 
-`render_unit` is deterministic and must stay that way. The unit has a `Generated by kiloaded` marker, `Type=simple`, absolute paths, `WorkingDirectory` set to `$HOME`, `Restart=on-failure`, `RestartSec=5`, `TimeoutStopSec=20`, `KillMode=mixed`, and `WantedBy=default.target`. `ExecStart` passes `--print-logs` so `kiloaded logs` shows the server's own log lines, not just the startup warning. The unit snapshots `HOME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`, and the XDG directory variables from the install environment because a user manager does not inherit an interactive shell's environment. That snapshot is also why updating the install (or reinstalling) is the way to refresh a stale `PATH`.
+`render_unit` is deterministic and must stay that way. The unit has a `Generated by kiloaded` marker, `Type=simple`, absolute paths, `WorkingDirectory` set to `$HOME`, `Restart=on-failure`, `RestartSec=5`, `TimeoutStopSec=20`, `KillMode=mixed`, and `WantedBy=default.target`. `ExecStart` passes `--print-logs` so `kiloaded logs` shows the server's own log lines, not just the startup warning. When remote control is on, the unit also carries `ExecStartPost=$XDG_DATA_HOME/kiloaded/libexec/kilo-remote` (see the remote-control section). The unit snapshots `HOME`, `PATH`, `SHELL`, `LANG`, `LC_ALL`, and the XDG directory variables from the install environment because a user manager does not inherit an interactive shell's environment. That snapshot is also why updating the install (or reinstalling) is the way to refresh a stale `PATH`.
 
 Do not add `After=network-online.target` or `Wants=network-online.target` to a user unit. Those are system-manager targets; a user manager does not have them, and the dependency is noise at best. `kilo serve` can start offline and reconnect later.
 
@@ -83,6 +84,24 @@ The default binding is loopback-only. `kilo serve` prints a warning when `KILO_S
 
 Additional environment variables (for example `KILO_SERVER_PASSWORD`, `SSH_AUTH_SOCK`, or a proxy setting) belong in a systemd drop-in, not in the manager's config, because a drop-in is the standard systemd mechanism and keeps secrets out of generated files that are rewritten on every update. The manager intentionally does not write an `EnvironmentFile`; an absolute, quoted `Environment=` snapshot is simpler and avoids the `EnvironmentFile` path-quoting edge cases.
 
+### Remote control (Kilo Cloud registration)
+
+`kilo serve` alone never talks to Kilo Cloud: the relay (`wss://ingest.kilosessions.ai`) is opt-in and is enabled per server process, either by the `remote_control` config key, by `/remote` in the TUI, or by `POST /remote/enable` on the running server. `kilo remote` is a decoy — it is a separate foreground command that spins up its own short-lived server, enables the relay for its own lifetime, and tears it down on exit; it never touches an already-running `kilo serve`.
+
+The manager therefore registers the relay from inside the unit: with remote control on (the default), `write_remote_helper` generates `libexec/kilo-remote`, and `render_unit` adds `ExecStartPost=...kilo-remote`. The helper POSTs `/remote/enable` on the configured `host:port` with a small retry loop (8 tries, 1 second apart, 2-second curl timeout — chosen so the worst case stays well inside `wait_active`'s ~30-second budget and systemd's default start timeout). It is strictly best-effort: it always exits 0, so a missing curl or a slow server can never fail the unit or trigger restart loops.
+
+Why POST and not the `remote_control` config key: the manager must not edit `~/.config/kilo/kilo.jsonc` (JSONC merging in POSIX sh is fragile, and that file is Kilo's), and the config key alone does not open the relay on an idle headless server — `enabled` flips to true but the websocket only attaches when an instance/session is created. The explicit POST opens it immediately. This was verified against CLI 7.8.27: `POST /remote/enable` returns 200 and `connected` becomes true within seconds, with heartbeats every 10 seconds while the server runs.
+
+Auth details of the local server: when `KILO_SERVER_PASSWORD` is set, the HTTP API requires HTTP Basic auth (username `kilo`, overridable with `KILO_SERVER_USERNAME`). Drop-in `Environment=` values reach `ExecStartPost`, so the helper reads the password from its environment at runtime (`curl -u "user:pass"`) and never writes it into generated files. The relay itself is an outbound websocket initiated by the server, so a loopback-only bind does not block remote control, and no inbound ports are needed.
+
+The enable does not persist across server restarts (it lives in the server process), which is exactly why it is re-issued as `ExecStartPost` after every start, including restarts after crashes and reboots. If the host is not logged in, the POST still returns 200 but the relay cannot authenticate to the cloud; the helper warns and the service stays healthy. Logging in and restarting fixes it.
+
+### Login
+
+`install` and `update` call `ensure_logged_in`. The check is `kilo profile` through the generated launcher: exit 0 means logged in; a non-zero exit whose output contains "Not authenticated" means logged out; any other failure (offline, API hiccup) is treated as unknown and only warns — a transient error must never trigger a login flow. `auth list` is not a usable check: it reports ambient credentials (env-injected API keys) even when no account is logged in.
+
+The login itself is `kilo auth login -p kilo`, Kilo's device-code flow: the CLI prints `https://app.kilo.ai/device-auth?code=...` plus a code and polls until the user approves. That is deliberately headless-friendly — an SSH user opens the URL on their phone. `login_command` picks the stdin for the flow: an inherited TTY when `[ -t 0 ]`, `$KILOADED_TTY` when set (tests; an empty value forces the non-interactive path), else `/dev/tty` when it can be opened, else it reports "no interactive terminal" and install continues without logging in. Nothing is ever written to or read from Kilo's credential storage by the manager; `kilo auth login` owns `~/.local/share/kilo/auth.json`. `kiloaded login` re-runs the flow on demand and prints the account via `kilo profile`.
+
 ### Removal semantics
 
 `remove` is best-effort with systemctl so it still cleans up files if the user manager is no longer reachable. It stops and disables the unit, removes the unit file, reloads systemd, removes the manager's data and config, and removes `~/.local/bin/kilo` only when that path is a symlink into the manager's data directory. It never overwrites a pre-existing regular `kilo` binary, and it never touches `~/.config/kilo` or `~/.local/share/kilo`. `--keep-cli` skips the CLI/data removal but still removes the service and config.
@@ -95,7 +114,7 @@ The `kiloaded` command itself is installed by `install.sh`, not by the manager's
 
 `./tests/run.sh` is the default test command. It must stay fast, offline, and systemd-free. Every test starts from a fresh `HOME` and XDG tree under a temp directory, puts `tests/fakes` first on `PATH`, and uses `KILOADED_SYSTEMD_RUNTIME` to point the systemd check at a temp directory. The fake npm creates the exact `node_modules/@kilocode/cli` layout, including `bin/.kilo`, `bin/tree-sitter`, and a runnable `--version`; the fake systemctl records calls and can fail a selected call or fail a call once for rollback tests.
 
-The suite covers fresh install, idempotent install, pinned versions, update, update rollback, update-before-install, remove, `--keep-cli`, non-Linux rejection, missing systemd rejection, invalid flags (including overlong ports), npm failure, systemctl failure, linger success/failure, status, logs, HOME/XDG paths with spaces, a pre-existing `kilo` launcher, `--no-start`, and pinned update. It also covers install verification failure, repair of a broken current install, corrupt-config recovery, crash-after-start detection, best-effort removal, foreign-unit protection, IPv6 URL formatting, the `install.sh` bootstrap (including HOME unset with `KILOADED_BIN_DIR`), and `systemd-analyze verify` when that tool is available. When adding a lifecycle feature, add a test that asserts both the resulting files and the systemctl call order. When adding a failure mode, assert that the previous install is still usable and that no partial unit/current link is left behind.
+The suite covers fresh install, idempotent install, pinned versions, update, update rollback, update-before-install, remove, `--keep-cli`, non-Linux rejection, missing systemd rejection, invalid flags (including overlong ports), npm failure, systemctl failure, linger success/failure, status, logs, HOME/XDG paths with spaces, a pre-existing `kilo` launcher, `--no-start`, and pinned update. It also covers install verification failure, repair of a broken current install, corrupt-config recovery, crash-after-start detection, best-effort removal, foreign-unit protection, IPv6 URL formatting, the `install.sh` bootstrap (including HOME unset with `KILOADED_BIN_DIR`), and `systemd-analyze verify` when that tool is available. Remote control and login are covered too: `--no-remote`/`--remote` flag and config persistence, old-config upgrade to remote-on, helper POST/auth/retry behavior, install-time login when logged out, non-interactive login skip, failed-login warning, and the standalone `login` command. When adding a lifecycle feature, add a test that asserts both the resulting files and the systemctl call order. When adding a failure mode, assert that the previous install is still usable and that no partial unit/current link is left behind.
 
 `KEEP_TEST_DIR=1 ./tests/run.sh` keeps the temp trees and prints their path; the failure output dumps the manager's stdout/stderr and the fake command logs.
 
@@ -108,6 +127,11 @@ These environment variables exist for tests and unusual installations. Do not re
 - `KILOADED_NPM`, `KILOADED_NODE` — absolute npm/node paths.
 - `KILOADED_BIN_DIR` — where `install.sh` and the `kilo` launcher live.
 - `KILOADED_STABLE_SECONDS` — post-start active-stability window (default 3; tests use 0).
+- `KILOADED_CURL` — the curl used by the remote helper and `status` (tests supply a fake); set it to an empty string to simulate a missing curl.
+- `KILOADED_REMOTE_TRIES`, `KILOADED_REMOTE_INTERVAL` — the remote helper's retry budget (tests shrink it to stay fast).
+- `KILOADED_TTY` — the stdin used for `kilo auth login` in `login_command`; an empty value forces the non-interactive path (tests run with stdin at `/dev/null`, which also covers the no-TTY case).
+- `FAKE_KILO_LOG`, `FAKE_KILO_LOGGED_OUT_FILE`, `FAKE_KILO_LOGIN_FAIL` — fake `.kilo` knobs: the log file, a marker file that makes `profile` report "Not authenticated" (the fake `auth login` removes it on success), and a switch that makes the login fail.
+- `FAKE_CURL_LOG`, `FAKE_CURL_BODY_FILE`, `FAKE_CURL_RC` — the test suite's fake curl (records arguments, optional canned JSON, optional failure).
 - `KILOADED_REF` — install.sh's raw GitHub ref, for testing a tag or branch.
 - `KILOADED_REAL`, `KILOADED_SMOKE_FROM`, `KILOADED_SMOKE_PORT` — smoke-test controls.
 
@@ -130,7 +154,7 @@ shellcheck -s sh kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*
 ./tests/run.sh
 ```
 
-Shellcheck is enforced in CI. The only intentional suppression is `SC2016` for the literal `${KILO_TREE_SITTER_WASM_DIR:-}` text in the generated wrapper. The `rm -rf "${CLI_ROOT:?}/..."` is a safety guard, not a suppression. Do not add blanket disables.
+Shellcheck is enforced in CI. The only intentional suppression is `SC2016` for the literal `${KILO_TREE_SITTER_WASM_DIR:-}` text in the generated wrapper. The remote helper avoids needing one: dynamic values are printed with `%s` and its static body lives in a single-quoted heredoc, so the helper's shell variables stay literal for the generated file. The `rm -rf "${CLI_ROOT:?}/..."` is a safety guard, not a suppression. Do not add blanket disables.
 
 ### CI
 
@@ -143,24 +167,27 @@ Shellcheck is enforced in CI. The only intentional suppression is `SC2016` for t
 - **Node is only needed for install/update and the fallback.** The normal service runs the native `.kilo` binary. Do not add a runtime node requirement to the service, and do not assume the systemd user manager's `PATH` contains node.
 - **The user manager needs a bus.** `systemctl --user` fails in a bare SSH session without `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` or a running user manager. `require_systemd` checks `systemctl --user show-environment` and reports this instead of writing a unit that can never start. Lingering makes the manager available at boot.
 - **PATH is snapshotted at install time.** If the user's node/npm/tool path changes, re-run `kiloaded install` (or `update`) to regenerate the unit. Do not try to source `.profile` from the unit.
-- **Secrets belong in a drop-in.** Use `systemctl --user edit kiloaded` to add `Environment=KILO_SERVER_PASSWORD=...` or `Environment=SSH_AUTH_SOCK=...`. The generated unit and config are mode 0644/0600 but still should not contain secrets.
+- **Secrets belong in a drop-in.** Use `systemctl --user edit kiloaded` to add `Environment=KILO_SERVER_PASSWORD=...` or `Environment=SSH_AUTH_SOCK=...`. The generated unit and config are mode 0644/0600 but still should not contain secrets. Drop-in variables reach `ExecStartPost` too, which is how the remote helper authenticates its POST.
+- **Remote control is per server process.** The relay is opened by `POST /remote/enable` (via the unit's `ExecStartPost` after every start) and lives only in that process; a restart drops it until the helper runs again. `kilo remote` does not help — it is a foreground command with its own ephemeral server. If a host shows `remote: enabled (not connected)` while idle, check that it is logged in: the enable returns 200 but the relay cannot authenticate without a Kilo account.
 - **`kilo serve` is unsecured on loopback.** The warning is expected. Non-loopback binds need a password or an authenticating proxy.
 - **Port 4096 is the default for a reason.** It is the URL used in the CLI docs' attach examples. Changing it is a user option, not a release decision.
-- **The health endpoint is `/global/health`.** `/` is empty, `/health` is 404, `/doc` is the OpenAPI document.
+- **The health endpoint is `/global/health`.** `/` is empty, `/health` is 404, `/doc` is the OpenAPI document. `/remote/status` reports the relay state and is what `kiloaded status` queries.
+- **Remote enable is idempotent but not persistent.** `POST /remote/enable` twice is fine; after a server restart the flag is gone, which is why the unit re-issues it as `ExecStartPost`.
 - **`systemctl --user daemon-reload` is required after writing the unit**, and `restart` is what picks up a new wrapper. `enable` alone does not restart an already-running service.
 - **Lingering is per-user.** Never disable it on remove; another service may depend on it.
 - **Root is a warning, not a supported target.** The service runs as root if installed by root. That is sometimes useful in a container but is not the intended deployment; do not add root-specific behavior.
 - **The manager is Linux-only.** `mv -T`, `readlink`, `stat -c`, `loginctl`, and systemd user units are deliberate Linux dependencies. Don't “port” it by adding macOS branches; a macOS tool would need launchd and a different unit model.
+- **curl is a runtime dependency of remote control.** `install.sh` already needs it to bootstrap, and the helper captures the absolute curl path at install time. If curl disappears afterwards, the helper warns and the service runs without the relay.
 - **install.sh trusts the repository.** It downloads the wrapper from `raw.githubusercontent.com` and executes it. There is no signature or checksum yet. Pinning `KILOADED_REF` to a tag is the current mitigation; if a checksum/release-asset flow is added, document it in README and AGENTS and test it.
 - **The generated unit is intentionally not an EnvironmentFile.** Absolute quoted `Environment=` lines make the wrapper path and PATH snapshot explicit. Adding `EnvironmentFile=` reintroduces path quoting and optional-file edge cases for little benefit.
 - **`kilo console` is deprecated.** Do not switch the service back to it. If Kilo removes `kilo serve` or changes its flags, update `render_unit`, the smoke test, and the README together.
 
 ## Release and change process
 
-- Bump `KILOADED_VERSION` in `kiloaded` for user-visible manager changes, and mention it in the commit/PR. The version command prints it.
+- Bump `KILOADED_VERSION` in `kiloaded` for user-visible manager changes, and mention it in the commit/PR. The version command prints it. `0.2.0` added remote-control registration and install-time login.
 - `install.sh` fetches `KILOADED_REF` (default `main`). Re-running the installer refreshes the `kiloaded` command itself; `kiloaded update` only updates the Kilo CLI. Keep that distinction in README.
 - If the Kilo CLI changes its npm package layout, update `resolve_exec_root`, the fake npm layout, the smoke test's version expectations, and this file together. The current layout is `node_modules/@kilocode/cli/bin/{kilo,.kilo,tree-sitter}` plus optional `@kilocode/cli-<platform>-<arch>` packages.
-- If the unit changes, regenerate it in a temp HOME and, when available, run `systemd-analyze verify` on the result. CI does not have a running systemd, so the hermetic tests assert the rendered text and the smoke test exercises the wrapper, not the unit parser.
+- If the unit changes, regenerate it in a temp HOME and, when available, run `systemd-analyze verify` on the result. CI does not have a running systemd, so the hermetic tests assert the rendered text and the smoke test exercises the wrapper, not the unit parser. Note that the helper's retry budget (8 tries, 1s apart, 2s curl timeout) must stay small: for `Type=simple` the start job does not finish until `ExecStartPost` exits, so a long loop would stretch `wait_active` and systemd's start timeout.
 - Keep README high level. Put failure modes, test hooks, and design rationale here, not there.
 
 ## Process notes from building this
@@ -169,5 +196,7 @@ Shellcheck is enforced in CI. The only intentional suppression is `SC2016` for t
 - **The issue's `process.execPath` approach is still the right fallback.** Kilo ships a native binary now, so the normal path is `.kilo` and the unit avoids node entirely. The node path stays for package layouts or postinstall failures where `.kilo` is missing.
 - **The package's JS launcher sets a tree-sitter env var.** Running `.kilo` directly without `KILO_TREE_SITTER_WASM_DIR` can break parsing, so the generated wrapper mirrors that behavior. This was a deliberate difference from “just point ExecStart at the binary”.
 - **Do not rely on `kilo serve`'s default port.** The default is `0`, which means random. A managed service needs a stable attach URL.
+- **The remote-control flow was verified against CLI 7.8.27.** A bare `kilo serve` reports `{"enabled":false,"connected":false}`, the config key alone reports `enabled:true` but keeps the websocket idle until an instance is created, and `POST /remote/enable` connects immediately and survives an idle server with 10-second heartbeats. Keep the ExecStartPost POST; do not switch to the config key.
 - **The real smoke test was run against 7.8.26 -> 7.8.27.** It installed both real packages, served both binaries, checked `/global/health`, and removed everything. Keep that path working when bumping versions.
+- **The login check and device-code flow were verified against 7.8.27.** `kilo profile` exits 1 with "Not authenticated with Kilo Gateway" when logged out, and `kilo auth login -p kilo` prints `https://app.kilo.ai/device-auth?code=...` and polls — it works with stdin closed, so the flow survives a `curl | sh` install.
 - **Test failures should show the manager's stdout/stderr and the relevant logs.** The harness dumps both on assertion failure; use that instead of adding ad-hoc debug prints to `kiloaded`.
