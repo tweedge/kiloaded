@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test double for uname: every test is Linux unless it says otherwise.
+printf '%s\n' "${FAKE_UNAME:-Linux}"

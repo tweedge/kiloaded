@@ -1,0 +1,5 @@
+#!/bin/sh
+# Test double for journalctl.
+printf '%s\n' "$*" >>"${FAKE_JOURNALCTL_LOG:-/dev/null}"
+printf '%s\n' "${FAKE_JOURNAL_OUTPUT:-fake journal output}"
+exit 0

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Test double for loginctl.
+printf '%s\n' "$*" >>"${FAKE_LOGINCTL_LOG:-/dev/null}"
+
+if [ "${FAKE_LOGINCTL_FAIL:-0}" = "1" ]; then
+    exit 1
+fi
+
+case "$1" in
+    show-user)
+        case "$*" in
+            *--value*) printf '%s\n' "${FAKE_LINGER:-yes}" ;;
+            *) printf 'Linger=%s\n' "${FAKE_LINGER:-yes}" ;;
+        esac
+        ;;
+esac
+exit 0

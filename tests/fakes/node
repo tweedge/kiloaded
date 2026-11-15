@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test double for node. kiloaded prefers the packaged native binary, so this
+# only has to satisfy the presence check and the uncommon node fallback.
+printf 'v20.0.0\n'
