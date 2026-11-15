@@ -1,0 +1,64 @@
+#!/bin/sh
+# Test double for npm. Creates the same layout kiloaded expects, without a
+# network download: package.json, bin/kilo, bin/.kilo, and tree-sitter files.
+set -eu
+
+printf '%s\n' "$*" >>"${FAKE_NPM_LOG:-/dev/null}"
+
+if [ "${FAKE_NPM_FAIL:-0}" = "1" ]; then
+    exit 1
+fi
+
+prefix=""
+spec=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --prefix)
+            prefix="$2"
+            shift 2
+            ;;
+        --prefix=*)
+            prefix="${1#--prefix=}"
+            shift
+            ;;
+        @kilocode/cli@*)
+            spec="${1#@kilocode/cli@}"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+[ -n "$prefix" ] || exit 1
+
+version="${FAKE_NPM_VERSION:-7.8.27}"
+if [ -n "$spec" ] && [ "$spec" != "latest" ]; then
+    version="$spec"
+fi
+
+pkg="$prefix/node_modules/@kilocode/cli"
+mkdir -p "$pkg/bin/tree-sitter"
+
+printf '{"name":"@kilocode/cli","version":"%s"}\n' "$version" >"$pkg/package.json"
+printf '%s\n' 'fake tree-sitter wasm' >"$pkg/bin/tree-sitter/tree-sitter.wasm"
+
+cat >"$pkg/bin/.kilo" <<EOF
+#!/bin/sh
+case "\${1:-}" in
+    --version) printf '%s\\n' "$version" ;;
+    --print-ts) printf '%s\\n' "\${KILO_TREE_SITTER_WASM_DIR:-}" ;;
+esac
+exit ${FAKE_NPM_BAD_BINARY:-0}
+EOF
+chmod 755 "$pkg/bin/.kilo"
+
+cat >"$pkg/bin/kilo" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+    --version) printf 'fake-node-launcher\n' ;;
+esac
+exit 0
+EOF
+chmod 755 "$pkg/bin/kilo"

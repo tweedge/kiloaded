@@ -1,0 +1,975 @@
+#!/bin/sh
+# kiloaded - install the Kilo CLI and run it as a per-user systemd service.
+#
+# Linux only. The service is a systemd --user unit, so it runs with the
+# installing user's UID, supplementary groups, HOME, and config. Nothing here
+# needs root, creates a service account, or writes outside the user's XDG
+# directories and the Kilo CLI's own data.
+set -eu
+
+KILOADED_VERSION="0.1.0"
+REPO="tweedge/kiloaded"
+SERVICE_NAME="kiloaded"
+DEFAULT_PORT="4096"
+DEFAULT_HOSTNAME="127.0.0.1"
+NPM_PACKAGE="@kilocode/cli"
+SYSTEMD_RUNTIME="${KILOADED_SYSTEMD_RUNTIME:-/run/systemd/system}"
+
+say() { printf 'kiloaded: %s\n' "$*"; }
+warn() { printf 'kiloaded: warning: %s\n' "$*" >&2; }
+die() {
+    printf 'kiloaded: error: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: kiloaded <command> [options]
+
+Commands:
+  install [options]   Install the Kilo CLI and the systemd --user service
+  update [options]    Update the Kilo CLI and restart the service
+  remove [options]    Stop and remove the service (and the CLI by default)
+  status              Show what is installed and whether it is running
+  logs [args...]      Follow or query the service journal
+  version             Show the kiloaded version
+
+Install options:
+  --version VERSION   Kilo CLI version to install (default: latest)
+  --port PORT         Port for `kilo serve` (default: 4096)
+  --hostname HOST     Address for `kilo serve` (default: 127.0.0.1)
+  --no-start          Install and enable, but do not start the service now
+  --no-linger         Do not enable login lingering (service starts at login)
+
+Update options:
+  --version VERSION   Version to update to (default: latest)
+
+Remove options:
+  --keep-cli          Keep the downloaded Kilo CLI and `kilo` launcher
+
+Run as the user who should own the service. kiloaded is Linux-only and needs
+systemd user services plus Node.js/npm for install and update.
+EOF
+}
+
+usage_error() {
+    printf 'kiloaded: error: %s\n' "$*" >&2
+    usage >&2
+    exit 2
+}
+
+# ---------------------------------------------------------------------------
+# Paths and small helpers
+# ---------------------------------------------------------------------------
+
+init_paths() {
+    [ -n "${HOME:-}" ] || die "HOME is not set"
+    case "$HOME" in
+        /*) ;;
+        *) die "HOME must be an absolute path" ;;
+    esac
+
+    if [ -n "${XDG_DATA_HOME:-}" ]; then
+        case "$XDG_DATA_HOME" in
+            /*) ;;
+            *) die "XDG_DATA_HOME must be an absolute path" ;;
+        esac
+    fi
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        case "$XDG_CONFIG_HOME" in
+            /*) ;;
+            *) die "XDG_CONFIG_HOME must be an absolute path" ;;
+        esac
+    fi
+    if [ -n "${XDG_STATE_HOME:-}" ]; then
+        case "$XDG_STATE_HOME" in
+            /*) ;;
+            *) die "XDG_STATE_HOME must be an absolute path" ;;
+        esac
+    fi
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+        case "$XDG_CACHE_HOME" in
+            /*) ;;
+            *) die "XDG_CACHE_HOME must be an absolute path" ;;
+        esac
+    fi
+
+    DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/kiloaded"
+    CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/kiloaded"
+    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    UNIT_PATH="$UNIT_DIR/$SERVICE_NAME.service"
+    CLI_ROOT="$DATA_ROOT/cli"
+    CURRENT_LINK="$CLI_ROOT/current"
+    LIBEXEC="$DATA_ROOT/libexec/kilo"
+    CONFIG_FILE="$CONFIG_ROOT/config"
+    BIN_DIR="${KILOADED_BIN_DIR:-$HOME/.local/bin}"
+    LAUNCHER="$BIN_DIR/kilo"
+}
+
+shell_quote() {
+    _sq=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+    printf "'%s'" "$_sq"
+}
+
+systemd_quote() {
+    _sdq=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g' -e 's/\$/$$/g')
+    printf '"%s"' "$_sdq"
+}
+
+systemd_env_quote() {
+    _sde=$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g')
+    printf '"%s"' "$_sde"
+}
+
+systemd_path() {
+    printf '%s' "$1" | sed 's/%/%%/g'
+}
+
+cleanup() {
+    if [ -n "${_CLEANUP:-}" ]; then
+        rm -rf "$_CLEANUP"
+        _CLEANUP=""
+    fi
+}
+trap cleanup 0
+trap 'cleanup; exit 1' 1 2 15
+
+port_is_valid() {
+    case "$1" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 5 ] || return 1
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+hostname_is_valid() {
+    [ -n "$1" ] || return 1
+    case "$1" in
+        *[!A-Za-z0-9.:_%-]*) return 1 ;;
+    esac
+}
+
+validate_port() {
+    if ! port_is_valid "$1"; then
+        die "port must be an integer from 1 to 65535 (got '$1')"
+    fi
+}
+
+validate_hostname() {
+    [ -n "$1" ] || die "hostname must not be empty"
+    if ! hostname_is_valid "$1"; then
+        die "hostname contains unsupported characters (got '$1')"
+    fi
+}
+
+validate_version() {
+    [ -n "$1" ] || die "version must not be empty"
+    case "$1" in
+        latest) ;;
+        *[!A-Za-z0-9._+-]*) die "version contains unsupported characters (got '$1')" ;;
+        .* | *..*) die "version must be a simple npm version or 'latest' (got '$1')" ;;
+    esac
+}
+
+warn_non_loopback() {
+    case "$1" in
+        127.* | localhost | ::1) ;;
+        *)
+            warn "kilo serve will listen on $1 without authentication"
+            warn "set KILO_SERVER_PASSWORD in a systemd drop-in if this is not a trusted network"
+            ;;
+    esac
+}
+
+check_linux() {
+    _os=$(uname -s 2>/dev/null || printf 'unknown')
+    [ "$_os" = "Linux" ] || die "kiloaded only supports Linux (found '$_os')"
+}
+
+check_user() {
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        die "run kiloaded as $SUDO_USER, not through sudo: the service must inherit that user's permissions"
+    fi
+    if [ "$(id -u)" -eq 0 ]; then
+        warn "running as root; the Kilo service will also run as root"
+    fi
+}
+
+require_systemd() {
+    [ -d "$SYSTEMD_RUNTIME" ] || die "kiloaded requires systemd user services ($SYSTEMD_RUNTIME is missing)"
+    SYSTEMCTL="${KILOADED_SYSTEMCTL:-}"
+    if [ -z "$SYSTEMCTL" ]; then
+        SYSTEMCTL=$(command -v systemctl 2>/dev/null || true)
+    fi
+    [ -n "$SYSTEMCTL" ] || die "systemctl was not found on PATH"
+
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+        XDG_RUNTIME_DIR="/run/user/$(id -u)"
+        export XDG_RUNTIME_DIR
+    fi
+
+    if ! "$SYSTEMCTL" --user show-environment >/dev/null 2>&1; then
+        die "the systemd user manager is not running; log in normally (or enable lingering) and retry"
+    fi
+}
+
+require_npm() {
+    NPM="${KILOADED_NPM:-}"
+    if [ -z "$NPM" ]; then
+        NPM=$(command -v npm 2>/dev/null || true)
+    fi
+    [ -n "$NPM" ] || die "npm was not found on PATH; install Node.js 20+ and npm first"
+
+    NODE="${KILOADED_NODE:-}"
+    if [ -z "$NODE" ]; then
+        NODE=$(command -v node 2>/dev/null || true)
+    fi
+    [ -n "$NODE" ] || die "node was not found on PATH; install Node.js 20+ and npm first"
+}
+
+systemctl_user() {
+    "$SYSTEMCTL" --user "$@"
+}
+
+ensure_dirs() {
+    mkdir -p "$DATA_ROOT" "$CONFIG_ROOT" "$UNIT_DIR" "$CLI_ROOT" "$(dirname "$LIBEXEC")"
+    chmod 700 "$DATA_ROOT" "$CONFIG_ROOT" "$CLI_ROOT" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Kilo CLI installation
+# ---------------------------------------------------------------------------
+
+read_package_version() {
+    [ -f "$1/package.json" ] || return 1
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/package.json" | head -n 1
+}
+
+current_version() {
+    [ -L "$CURRENT_LINK" ] || return 1
+    _target=$(readlink "$CURRENT_LINK" 2>/dev/null || true)
+    [ -n "$_target" ] || return 1
+    printf '%s\n' "${_target##*/}"
+}
+
+resolve_exec_root() {
+    _root="$1"
+    _pkg="$_root/node_modules/@kilocode/cli"
+    EXEC_MODE=""
+    EXEC_PATH=""
+    EXEC_ENTRY=""
+    TS_DIR="$_pkg/bin/tree-sitter"
+
+    if [ -x "$_pkg/bin/.kilo" ]; then
+        EXEC_MODE="native"
+        EXEC_PATH="$_pkg/bin/.kilo"
+        return 0
+    fi
+    if [ -n "${NODE:-}" ] && [ -f "$_pkg/bin/kilo" ]; then
+        EXEC_MODE="node"
+        EXEC_PATH="$NODE"
+        EXEC_ENTRY="$_pkg/bin/kilo"
+        return 0
+    fi
+    return 1
+}
+
+verify_exec() {
+    if [ "$EXEC_MODE" = "native" ]; then
+        _out=$("$EXEC_PATH" --version 2>&1) || return 1
+    else
+        _out=$("$EXEC_PATH" "$EXEC_ENTRY" --version 2>&1) || return 1
+    fi
+    _out=$(printf '%s\n' "$_out" | head -n 1)
+    [ -n "$_out" ] || return 1
+    VERIFIED_VERSION="$_out"
+}
+
+link_current() {
+    _version="$1"
+    _link_tmp="$CURRENT_LINK.tmp.$$"
+    rm -f "$_link_tmp"
+    ln -s "$_version" "$_link_tmp"
+    if [ -L "$CURRENT_LINK" ] || [ ! -e "$CURRENT_LINK" ]; then
+        mv -Tf "$_link_tmp" "$CURRENT_LINK"
+    else
+        rm -rf "$CURRENT_LINK"
+        mv "$_link_tmp" "$CURRENT_LINK"
+    fi
+}
+
+install_cli() {
+    _spec="$1"
+    _reuse="$2"
+    _current=$(current_version || true)
+
+    if [ -n "$_current" ] && [ -d "$CLI_ROOT/$_current/node_modules/@kilocode/cli" ]; then
+        if resolve_exec_root "$CLI_ROOT/$_current" && verify_exec; then
+            if [ "$_spec" = "latest" ] && [ "$_reuse" = "1" ]; then
+                say "using installed Kilo CLI $_current"
+                return 0
+            fi
+            if [ "$_spec" != "latest" ] && [ "$_spec" = "$_current" ]; then
+                say "Kilo CLI $_current is already installed"
+                return 0
+            fi
+        else
+            warn "installed Kilo CLI $_current is not runnable; reinstalling it"
+        fi
+    fi
+
+    if [ "$_spec" != "latest" ] && [ -d "$CLI_ROOT/$_spec/node_modules/@kilocode/cli" ]; then
+        if resolve_exec_root "$CLI_ROOT/$_spec" && verify_exec; then
+            say "using cached Kilo CLI $_spec"
+            link_current "$_spec"
+            return 0
+        fi
+        warn "cached Kilo CLI $_spec is not runnable; replacing it"
+        rm -rf "${CLI_ROOT:?}/$_spec"
+    fi
+
+    _tmp="$CLI_ROOT/.install.$$"
+    rm -rf "$_tmp"
+    mkdir -p "$_tmp"
+    _CLEANUP="$_tmp"
+
+    say "installing $NPM_PACKAGE@$_spec (this downloads the Kilo binary)..."
+    if ! "$NPM" install --prefix "$_tmp" --include=optional --no-audit --no-fund --loglevel=error "$NPM_PACKAGE@$_spec"; then
+        die "npm install failed; the existing Kilo CLI (if any) was left untouched"
+    fi
+
+    _version=$(read_package_version "$_tmp/node_modules/@kilocode/cli" || true)
+    case "$_version" in
+        '' | .* | *..* | *[!A-Za-z0-9._+-]*) die "could not determine the installed Kilo CLI version" ;;
+    esac
+
+    if ! resolve_exec_root "$_tmp" || ! verify_exec; then
+        die "the downloaded Kilo CLI did not run; existing installation was left untouched"
+    fi
+
+    _new=0
+    if [ -d "$CLI_ROOT/$_version" ]; then
+        if resolve_exec_root "$CLI_ROOT/$_version" && verify_exec; then
+            rm -rf "$_tmp"
+            _CLEANUP=""
+            say "using cached Kilo CLI $_version"
+        else
+            warn "cached Kilo CLI $_version is not runnable; replacing it"
+            rm -rf "${CLI_ROOT:?}/$_version"
+            mv "$_tmp" "$CLI_ROOT/$_version"
+            _CLEANUP=""
+            _new=1
+        fi
+    else
+        mv "$_tmp" "$CLI_ROOT/$_version"
+        _CLEANUP=""
+        _new=1
+    fi
+
+    if ! resolve_exec_root "$CLI_ROOT/$_version" || ! verify_exec; then
+        if [ "$_new" = "1" ]; then
+            rm -rf "${CLI_ROOT:?}/$_version"
+        fi
+        die "the downloaded Kilo CLI did not run; existing installation was left untouched"
+    fi
+
+    link_current "$_version"
+    say "installed Kilo CLI $VERIFIED_VERSION"
+}
+
+write_launcher() {
+    resolve_exec_root "$CURRENT_LINK" || die "the current Kilo CLI is missing or incomplete"
+
+    _launcher_tmp="$LIBEXEC.tmp.$$"
+    {
+        printf '#!/bin/sh\n'
+        printf '# Generated by kiloaded. Re-run install or update instead of editing.\n'
+        if [ "$EXEC_MODE" = "native" ] && [ -d "$TS_DIR" ]; then
+            # shellcheck disable=SC2016
+            printf 'if [ -z "${KILO_TREE_SITTER_WASM_DIR:-}" ]; then\n'
+            printf '    KILO_TREE_SITTER_WASM_DIR=%s\n' "$(shell_quote "$TS_DIR")"
+            printf '    export KILO_TREE_SITTER_WASM_DIR\n'
+            printf 'fi\n'
+        fi
+        if [ "$EXEC_MODE" = "native" ]; then
+            printf 'exec %s "$@"\n' "$(shell_quote "$EXEC_PATH")"
+        else
+            printf 'exec %s %s "$@"\n' "$(shell_quote "$EXEC_PATH")" "$(shell_quote "$EXEC_ENTRY")"
+        fi
+    } >"$_launcher_tmp"
+    chmod 700 "$_launcher_tmp"
+    mv -f "$_launcher_tmp" "$LIBEXEC"
+}
+
+install_launcher() {
+    mkdir -p "$BIN_DIR" || die "could not create $BIN_DIR"
+
+    if [ -L "$LAUNCHER" ]; then
+        _target=$(readlink "$LAUNCHER" 2>/dev/null || true)
+        case "$_target" in
+            "$LIBEXEC" | "$DATA_ROOT"/*)
+                rm -f "$LAUNCHER"
+                ln -s "$LIBEXEC" "$LAUNCHER"
+                ;;
+            *)
+                warn "leaving existing $LAUNCHER alone (it does not point at kiloaded)"
+                ;;
+        esac
+    elif [ -e "$LAUNCHER" ]; then
+        warn "leaving existing $LAUNCHER alone (it is not managed by kiloaded)"
+    else
+        ln -s "$LIBEXEC" "$LAUNCHER"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Config and unit rendering
+# ---------------------------------------------------------------------------
+
+write_config() {
+    _config_tmp="$CONFIG_FILE.tmp.$$"
+    {
+        printf '# Generated by kiloaded. Re-run install with new options instead of editing.\n'
+        printf 'KILOADED_PORT=%s\n' "$PORT"
+        printf 'KILOADED_HOSTNAME=%s\n' "$HOSTNAME"
+    } >"$_config_tmp"
+    chmod 600 "$_config_tmp"
+    mv -f "$_config_tmp" "$CONFIG_FILE"
+}
+
+load_config() {
+    PORT="$DEFAULT_PORT"
+    HOSTNAME="$DEFAULT_HOSTNAME"
+    [ -f "$CONFIG_FILE" ] || return 0
+
+    _config_port=""
+    _config_hostname=""
+    while IFS= read -r _config_line || [ -n "$_config_line" ]; do
+        case "$_config_line" in
+            KILOADED_PORT=*) _config_port="${_config_line#KILOADED_PORT=}" ;;
+            KILOADED_HOSTNAME=*) _config_hostname="${_config_line#KILOADED_HOSTNAME=}" ;;
+        esac
+    done <"$CONFIG_FILE"
+
+    if [ -n "$_config_port" ]; then
+        if port_is_valid "$_config_port"; then
+            PORT="$_config_port"
+        else
+            warn "ignoring invalid port in $CONFIG_FILE"
+        fi
+    fi
+    if [ -n "$_config_hostname" ]; then
+        if hostname_is_valid "$_config_hostname"; then
+            HOSTNAME="$_config_hostname"
+        else
+            warn "ignoring invalid hostname in $CONFIG_FILE"
+        fi
+    fi
+}
+
+render_unit() {
+    printf '%s\n' '# Generated by kiloaded. Re-run install or update instead of editing.'
+    printf '%s\n' '[Unit]'
+    printf 'Description=kiloaded - Kilo CLI background server\n'
+    printf 'Documentation=https://github.com/%s\n' "$REPO"
+    printf '\n'
+    printf '%s\n' '[Service]'
+    printf '%s\n' '# User unit: no User= is set, so this runs as the installing user with'
+    printf '%s\n' '# that user'\''s UID, supplementary groups, HOME, and file permissions.'
+    printf 'Type=simple\n'
+    printf 'WorkingDirectory=%s\n' "$(systemd_path "$HOME")"
+    printf 'Environment=%s\n' "$(systemd_env_quote "HOME=$HOME")"
+    printf 'Environment=%s\n' "$(systemd_env_quote "PATH=$PATH")"
+    if [ -n "${SHELL:-}" ]; then
+        printf 'Environment=%s\n' "$(systemd_env_quote "SHELL=$SHELL")"
+    fi
+    if [ -n "${LANG:-}" ]; then
+        printf 'Environment=%s\n' "$(systemd_env_quote "LANG=$LANG")"
+    fi
+    if [ -n "${LC_ALL:-}" ]; then
+        printf 'Environment=%s\n' "$(systemd_env_quote "LC_ALL=$LC_ALL")"
+    fi
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf 'Environment=%s\n' "$(systemd_env_quote "XDG_CONFIG_HOME=$XDG_CONFIG_HOME")"
+    fi
+    if [ -n "${XDG_DATA_HOME:-}" ]; then
+        printf 'Environment=%s\n' "$(systemd_env_quote "XDG_DATA_HOME=$XDG_DATA_HOME")"
+    fi
+    if [ -n "${XDG_STATE_HOME:-}" ]; then
+        printf 'Environment=%s\n' "$(systemd_env_quote "XDG_STATE_HOME=$XDG_STATE_HOME")"
+    fi
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+        printf 'Environment=%s\n' "$(systemd_env_quote "XDG_CACHE_HOME=$XDG_CACHE_HOME")"
+    fi
+    printf 'ExecStart=%s serve --print-logs --hostname %s --port %s\n' \
+        "$(systemd_quote "$LIBEXEC")" \
+        "$(systemd_quote "$HOSTNAME")" \
+        "$(systemd_quote "$PORT")"
+    printf 'Restart=on-failure\n'
+    printf 'RestartSec=5\n'
+    printf 'TimeoutStopSec=20\n'
+    printf 'KillMode=mixed\n'
+    printf '\n'
+    printf '%s\n' '[Install]'
+    printf 'WantedBy=default.target\n'
+}
+
+write_unit() {
+    _unit_tmp="$UNIT_PATH.tmp.$$"
+    render_unit >"$_unit_tmp"
+    chmod 644 "$_unit_tmp"
+    mv -f "$_unit_tmp" "$UNIT_PATH"
+}
+
+ensure_unit_owned() {
+    if [ -f "$UNIT_PATH" ] && ! grep -Fq 'Generated by kiloaded' "$UNIT_PATH"; then
+        die "refusing to overwrite $UNIT_PATH: it was not generated by kiloaded"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Service lifecycle
+# ---------------------------------------------------------------------------
+
+journalctl_path() {
+    JOURNALCTL="${KILOADED_JOURNALCTL:-}"
+    if [ -z "$JOURNALCTL" ]; then
+        JOURNALCTL=$(command -v journalctl 2>/dev/null || true)
+    fi
+    printf '%s\n' "$JOURNALCTL"
+}
+
+show_failure_logs() {
+    _journal=$(journalctl_path)
+    if [ -n "$_journal" ]; then
+        printf 'kiloaded: recent service log:\n' >&2
+        "$_journal" --user -u "$SERVICE_NAME.service" -n 20 --no-pager >&2 2>/dev/null || true
+    fi
+}
+
+wait_active() {
+    _tries=0
+    _stable_seconds="${KILOADED_STABLE_SECONDS:-3}"
+    case "$_stable_seconds" in
+        '' | *[!0-9]*) _stable_seconds=3 ;;
+    esac
+
+    while [ "$_tries" -lt 60 ]; do
+        if systemctl_user is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+            if [ "$_stable_seconds" -gt 0 ]; then
+                sleep "$_stable_seconds"
+            fi
+            if systemctl_user is-active --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+                return 0
+            fi
+            return 1
+        fi
+        if systemctl_user is-failed --quiet "$SERVICE_NAME.service" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.5
+        _tries=$((_tries + 1))
+    done
+    return 1
+}
+
+start_service() {
+    _do_start="$1"
+    systemctl_user daemon-reload || die "systemctl daemon-reload failed"
+    systemctl_user enable "$SERVICE_NAME.service" || die "could not enable $SERVICE_NAME.service"
+    if [ "$_do_start" = "1" ]; then
+        systemctl_user restart "$SERVICE_NAME.service" || {
+            show_failure_logs
+            die "could not start $SERVICE_NAME.service"
+        }
+        wait_active || {
+            show_failure_logs
+            die "$SERVICE_NAME.service did not become active"
+        }
+    fi
+}
+
+restart_service() {
+    systemctl_user daemon-reload || return 1
+    systemctl_user restart "$SERVICE_NAME.service" || return 1
+    wait_active
+}
+
+enable_linger() {
+    [ "${LINGER:-1}" = "1" ] || return 0
+    _loginctl="${KILOADED_LOGINCTL:-}"
+    if [ -z "$_loginctl" ]; then
+        _loginctl=$(command -v loginctl 2>/dev/null || true)
+    fi
+    if [ -z "$_loginctl" ]; then
+        warn "loginctl not found; enable lingering manually if the service should run without a login"
+        return 0
+    fi
+    if "$_loginctl" enable-linger "$(id -un)" >/dev/null 2>&1; then
+        say "lingering enabled (the service starts at boot without a login)"
+    else
+        warn "could not enable lingering; the service will start when you log in"
+        warn "enable it later with: loginctl enable-linger $(id -un)"
+    fi
+}
+
+format_url() {
+    _url_host="$1"
+    _url_port="$2"
+    case "$_url_host" in
+        0.0.0.0 | :: | '[::]') _url_host="$DEFAULT_HOSTNAME" ;;
+    esac
+    case "$_url_host" in
+        *:*) printf 'http://[%s]:%s' "$_url_host" "$_url_port" ;;
+        *) printf 'http://%s:%s' "$_url_host" "$_url_port" ;;
+    esac
+}
+
+print_summary() {
+    _version=$(current_version || printf 'unknown')
+    say "Kilo CLI: $_version"
+    say "service: $SERVICE_NAME.service (systemd --user)"
+    say "unit: $UNIT_PATH"
+    say "url: $(format_url "$HOSTNAME" "$PORT")"
+    say "logs: kiloaded logs -f"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+    OPT_VERSION="latest"
+    OPT_PORT=""
+    OPT_HOSTNAME=""
+    START=1
+    LINGER=1
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --version)
+                [ $# -ge 2 ] || usage_error "--version requires a value"
+                OPT_VERSION="$2"
+                shift 2
+                ;;
+            --version=*)
+                OPT_VERSION="${1#--version=}"
+                shift
+                ;;
+            --port)
+                [ $# -ge 2 ] || usage_error "--port requires a value"
+                OPT_PORT="$2"
+                shift 2
+                ;;
+            --port=*)
+                OPT_PORT="${1#--port=}"
+                shift
+                ;;
+            --hostname)
+                [ $# -ge 2 ] || usage_error "--hostname requires a value"
+                OPT_HOSTNAME="$2"
+                shift 2
+                ;;
+            --hostname=*)
+                OPT_HOSTNAME="${1#--hostname=}"
+                shift
+                ;;
+            --no-start)
+                START=0
+                shift
+                ;;
+            --no-linger)
+                LINGER=0
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            *)
+                usage_error "unknown install option '$1'"
+                ;;
+        esac
+    done
+
+    validate_version "$OPT_VERSION"
+    if [ -n "$OPT_PORT" ]; then
+        validate_port "$OPT_PORT"
+    fi
+    if [ -n "$OPT_HOSTNAME" ]; then
+        validate_hostname "$OPT_HOSTNAME"
+    fi
+    init_paths
+    check_linux
+    check_user
+    require_systemd
+    require_npm
+    ensure_unit_owned
+    ensure_dirs
+
+    load_config
+    if [ -n "$OPT_PORT" ]; then
+        PORT="$OPT_PORT"
+    fi
+    if [ -n "$OPT_HOSTNAME" ]; then
+        HOSTNAME="$OPT_HOSTNAME"
+    fi
+    validate_port "$PORT"
+    validate_hostname "$HOSTNAME"
+    warn_non_loopback "$HOSTNAME"
+
+    install_cli "$OPT_VERSION" 1
+    write_config
+    write_launcher
+    install_launcher
+    write_unit
+    start_service "$START"
+    enable_linger
+    print_summary
+}
+
+cmd_update() {
+    OPT_VERSION="latest"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --version)
+                [ $# -ge 2 ] || usage_error "--version requires a value"
+                OPT_VERSION="$2"
+                shift 2
+                ;;
+            --version=*)
+                OPT_VERSION="${1#--version=}"
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            *)
+                usage_error "unknown update option '$1'"
+                ;;
+        esac
+    done
+
+    validate_version "$OPT_VERSION"
+    init_paths
+    check_linux
+    check_user
+    require_systemd
+    require_npm
+    ensure_unit_owned
+    ensure_dirs
+
+    _old=$(current_version || true)
+    [ -n "$_old" ] || die "kiloaded is not installed; run 'kiloaded install' first"
+
+    load_config
+    validate_port "$PORT"
+    validate_hostname "$HOSTNAME"
+    warn_non_loopback "$HOSTNAME"
+    write_config
+
+    install_cli "$OPT_VERSION" 0
+    _new=$(current_version || true)
+    [ -n "$_new" ] || die "update finished but no current Kilo CLI is linked"
+
+    write_launcher
+    write_unit
+
+    if ! restart_service; then
+        show_failure_logs
+        warn "the new version failed to start; rolling back to $_old"
+        link_current "$_old"
+        write_launcher
+        if restart_service; then
+            die "update failed; rolled back to $_old"
+        fi
+        die "update failed and the rollback also failed; the service is stopped"
+    fi
+
+    if [ "$_old" = "$_new" ]; then
+        say "Kilo CLI $_new is already current"
+    else
+        say "updated Kilo CLI $_old -> $_new"
+        prune_versions "$_new"
+    fi
+    print_summary
+}
+
+prune_versions() {
+    _keep="$1"
+    for _dir in "$CLI_ROOT"/*; do
+        [ -e "$_dir" ] || continue
+        [ -d "$_dir" ] || continue
+        if [ -L "$_dir" ]; then
+            continue
+        fi
+        _name=${_dir##*/}
+        if [ "$_name" = "$_keep" ]; then
+            continue
+        fi
+        rm -rf "$_dir"
+    done
+}
+
+cmd_remove() {
+    KEEP_CLI=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --keep-cli)
+                KEEP_CLI=1
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            *)
+                usage_error "unknown remove option '$1'"
+                ;;
+        esac
+    done
+
+    init_paths
+    check_linux
+    check_user
+
+    if [ -f "$UNIT_PATH" ] && ! grep -Fq 'Generated by kiloaded' "$UNIT_PATH"; then
+        die "refusing to remove $UNIT_PATH: it was not generated by kiloaded"
+    fi
+
+    _systemctl=$(command -v systemctl 2>/dev/null || true)
+    if [ -n "$_systemctl" ]; then
+        "$_systemctl" --user stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+        "$_systemctl" --user disable "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$UNIT_PATH"
+    rm -f "$UNIT_DIR/default.target.wants/$SERVICE_NAME.service"
+    if [ -n "$_systemctl" ]; then
+        "$_systemctl" --user daemon-reload >/dev/null 2>&1 || true
+        "$_systemctl" --user reset-failed "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+    fi
+
+    if [ "$KEEP_CLI" = "0" ]; then
+        case "$DATA_ROOT" in
+            */kiloaded) rm -rf "$DATA_ROOT" ;;
+            *) die "refusing to remove unexpected data path '$DATA_ROOT'" ;;
+        esac
+
+        if [ -L "$LAUNCHER" ]; then
+            _target=$(readlink "$LAUNCHER" 2>/dev/null || true)
+            case "$_target" in
+                "$LIBEXEC" | "$DATA_ROOT"/*) rm -f "$LAUNCHER" ;;
+            esac
+        fi
+        say "removed the Kilo CLI and kiloaded data"
+    else
+        say "kept the Kilo CLI at $DATA_ROOT"
+    fi
+
+    case "$CONFIG_ROOT" in
+        */kiloaded) rm -rf "$CONFIG_ROOT" ;;
+        *) die "refusing to remove unexpected config path '$CONFIG_ROOT'" ;;
+    esac
+
+    say "removed $SERVICE_NAME.service"
+    say "Kilo settings and authentication in ~/.config/kilo were not touched"
+}
+
+cmd_status() {
+    init_paths
+    check_linux
+
+    _version=$(current_version || true)
+    _unit=0
+    if [ -f "$UNIT_PATH" ]; then
+        _unit=1
+    fi
+
+    if [ -z "$_version" ] && [ "$_unit" = "0" ]; then
+        say "not installed"
+        exit 1
+    fi
+
+    printf 'kiloaded: %s\n' "$KILOADED_VERSION"
+    printf 'Kilo CLI: %s\n' "${_version:-not installed}"
+    printf 'service: %s\n' "$SERVICE_NAME.service"
+    printf 'unit: %s\n' "$UNIT_PATH"
+
+    _systemctl=$(command -v systemctl 2>/dev/null || true)
+    if [ -n "$_systemctl" ] && [ -d "$SYSTEMD_RUNTIME" ]; then
+        if "$_systemctl" --user is-enabled --quiet "$SERVICE_NAME.service" >/dev/null 2>&1; then
+            printf 'enabled: yes\n'
+        else
+            printf 'enabled: no\n'
+        fi
+        if "$_systemctl" --user is-active --quiet "$SERVICE_NAME.service" >/dev/null 2>&1; then
+            printf 'active: yes\n'
+        else
+            printf 'active: no\n'
+        fi
+    else
+        printf 'service state: unknown (systemctl unavailable)\n'
+    fi
+
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+        printf 'url: %s\n' "$(format_url "$HOSTNAME" "$PORT")"
+    fi
+
+    _loginctl=$(command -v loginctl 2>/dev/null || true)
+    if [ -n "$_loginctl" ]; then
+        _linger=$("$_loginctl" show-user "$(id -un)" -p Linger --value 2>/dev/null || true)
+        case "$_linger" in
+            yes | Linger=yes) printf 'linger: yes\n' ;;
+            no | Linger=no) printf 'linger: no\n' ;;
+            *) printf 'linger: unknown\n' ;;
+        esac
+    fi
+
+    printf 'logs: kiloaded logs -f\n'
+}
+
+cmd_logs() {
+    init_paths
+    _journal=$(journalctl_path)
+    [ -n "$_journal" ] || die "journalctl was not found on PATH"
+    exec "$_journal" --user -u "$SERVICE_NAME.service" "$@"
+}
+
+cmd_version() {
+    printf 'kiloaded %s\n' "$KILOADED_VERSION"
+    init_paths
+    _version=$(current_version || true)
+    if [ -n "$_version" ]; then
+        printf 'Kilo CLI %s\n' "$_version"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+[ $# -gt 0 ] || {
+    usage >&2
+    exit 2
+}
+
+_command="$1"
+shift
+
+case "$_command" in
+    install) cmd_install "$@" ;;
+    update) cmd_update "$@" ;;
+    remove | uninstall) cmd_remove "$@" ;;
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    version | --version) cmd_version "$@" ;;
+    help | --help | -h) usage ;;
+    *)
+        usage_error "unknown command '$_command'"
+        ;;
+esac
