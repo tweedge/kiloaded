@@ -10,8 +10,6 @@ set -eu
 
 REPO="tweedge/kiloaded"
 REF="${KILOADED_REF:-main}"
-BIN_DIR="${KILOADED_BIN_DIR:-$HOME/.local/bin}"
-DEST="$BIN_DIR/kiloaded"
 
 say() { printf 'kiloaded install: %s\n' "$*"; }
 die() {
@@ -19,7 +17,13 @@ die() {
     exit 1
 }
 
-[ -n "${HOME:-}" ] || die "HOME is not set"
+BIN_DIR="${KILOADED_BIN_DIR:-}"
+if [ -z "$BIN_DIR" ]; then
+    [ -n "${HOME:-}" ] || die "HOME is not set (or set KILOADED_BIN_DIR)"
+    BIN_DIR="$HOME/.local/bin"
+fi
+DEST="$BIN_DIR/kiloaded"
+
 command -v curl >/dev/null 2>&1 || die "this script needs curl on PATH"
 
 case "$(uname -s 2>/dev/null || printf 'unknown')" in

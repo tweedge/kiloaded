@@ -15,6 +15,10 @@ if [ "${KILOADED_REAL:-0}" != "1" ]; then
     exit 0
 fi
 
+unset KILOADED_SYSTEMCTL KILOADED_LOGINCTL KILOADED_JOURNALCTL
+unset KILOADED_NPM KILOADED_NODE KILOADED_REF KILOADED_BIN_DIR
+unset KILOADED_STABLE_SECONDS SUDO_USER
+
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 FROM="${KILOADED_SMOKE_FROM:-7.8.26}"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/kiloaded-smoke.XXXXXX") || exit 1

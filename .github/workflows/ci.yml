@@ -17,8 +17,10 @@ jobs:
 
       - name: Shell syntax
         run: |
-          dash -n kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*
-          bash -n kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*
+          for f in kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*; do
+            dash -n "$f"
+            bash -n "$f"
+          done
 
       - name: ShellCheck
         run: |

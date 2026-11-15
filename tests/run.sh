@@ -35,6 +35,8 @@ setup() {
     unset KILOADED_SYSTEMCTL KILOADED_LOGINCTL KILOADED_JOURNALCTL
     unset KILOADED_NPM KILOADED_NODE KILOADED_BIN_DIR
     unset KILOADED_REF KILOADED_TEST_SOURCE SUDO_USER
+    unset KILOADED_STABLE_SECONDS
+    export KILOADED_STABLE_SECONDS="0"
 
     export PATH="$FAKES:$BASE_PATH"
     export FAKE_UNAME="Linux"
@@ -45,6 +47,8 @@ setup() {
     export FAKE_JOURNALCTL_LOG="$CASE/journalctl.log"
     export FAKE_JOURNAL_OUTPUT="fake journal output"
     export FAKE_SYSTEMCTL_ACTIVE="1"
+    export FAKE_SYSTEMCTL_ACTIVE_ONCE="0"
+    export FAKE_SYSTEMCTL_ACTIVE_ONCE_MARK="$CASE/systemctl.active-once"
     export FAKE_SYSTEMCTL_ENABLED="1"
     export FAKE_LOGINCTL_FAIL="0"
     export FAKE_LINGER="yes"
@@ -267,7 +271,7 @@ test_install_fresh() {
     assert_line_absent "$UNIT" 'network-online'
 
     assert_contains "$CONFIG" 'KILOADED_PORT=5123'
-    assert_contains "$CONFIG" "KILOADED_HOSTNAME='127.0.0.1'"
+    assert_contains "$CONFIG" 'KILOADED_HOSTNAME=127.0.0.1'
 
     assert_contains "$FAKE_NPM_LOG" '@kilocode/cli@latest'
     assert_contains "$FAKE_SYSTEMCTL_LOG" '--user daemon-reload'
@@ -330,6 +334,52 @@ test_install_verify_failure() {
     assert_symlink "$XDG_DATA_HOME/kiloaded/cli/current" "7.8.27"
     assert_not_exists "$XDG_DATA_HOME/kiloaded/cli/7.8.28"
     assert_eq "$("$XDG_DATA_HOME/kiloaded/libexec/kilo" --version)" "7.8.27"
+}
+
+test_install_repairs_broken_current() {
+    setup
+    run_k install --version 7.8.27 --no-linger
+    assert_ok
+
+    BIN="$XDG_DATA_HOME/kiloaded/cli/7.8.27/node_modules/@kilocode/cli/bin/.kilo"
+    printf '%s\n' '#!/bin/sh' 'exit 1' >"$BIN"
+    chmod 755 "$BIN"
+
+    : >"$FAKE_NPM_LOG"
+    run_k install --no-linger
+    assert_ok
+    assert_err 'is not runnable'
+    assert_contains "$FAKE_NPM_LOG" '@kilocode/cli@latest'
+    assert_eq "$("$XDG_DATA_HOME/kiloaded/libexec/kilo" --version)" "7.8.27"
+}
+
+test_install_crash_after_start() {
+    setup
+    KILOADED_STABLE_SECONDS="1"
+    FAKE_SYSTEMCTL_ACTIVE_ONCE="1"
+    export KILOADED_STABLE_SECONDS FAKE_SYSTEMCTL_ACTIVE_ONCE
+    run_k install --no-linger
+    assert_fail
+    assert_err 'did not become active'
+}
+
+test_corrupt_config() {
+    setup
+    run_k install --port 5123 --no-linger
+    assert_ok
+
+    printf '%s\n' 'KILOADED_PORT=not-a-port' 'KILOADED_HOSTNAME=bad host' >"$XDG_CONFIG_HOME/kiloaded/config"
+    run_k install --no-linger
+    assert_ok
+    assert_err 'ignoring invalid port'
+    assert_contains "$XDG_CONFIG_HOME/kiloaded/config" 'KILOADED_PORT=4096'
+    assert_contains "$XDG_CONFIG_HOME/kiloaded/config" 'KILOADED_HOSTNAME=127.0.0.1'
+    assert_contains "$XDG_CONFIG_HOME/systemd/user/kiloaded.service" '--port "4096"'
+
+    printf '%s\n' 'garbage' 'KILOADED_HOSTNAME=bad host' >"$XDG_CONFIG_HOME/kiloaded/config"
+    run_k update
+    assert_ok
+    assert_contains "$XDG_CONFIG_HOME/kiloaded/config" 'KILOADED_HOSTNAME=127.0.0.1'
 }
 
 test_update() {
@@ -473,6 +523,10 @@ test_invalid_options() {
     assert_err 'port must be'
 
     run_k install --port 70000
+    assert_status 1
+    assert_err 'port must be'
+
+    run_k install --port 999999999999999999999999
     assert_status 1
     assert_err 'port must be'
 
@@ -624,6 +678,25 @@ test_install_sh() {
     assert_out 'installed wrapper'
 }
 
+test_install_sh_home_unset() {
+    setup
+    export KILOADED_BIN_DIR="$CASE/user-bin"
+    make_curl_fake
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"$CASE/stub-kiloaded"
+    chmod 755 "$CASE/stub-kiloaded"
+    export KILOADED_TEST_SOURCE="$CASE/stub-kiloaded"
+    unset HOME
+    run_install_sh --no-linger
+    assert_ok
+    assert_exists "$KILOADED_BIN_DIR/kiloaded"
+    assert_eq "$(head -n 1 "$KILOADED_BIN_DIR/kiloaded")" '#!/bin/sh'
+
+    unset KILOADED_BIN_DIR
+    run_install_sh --no-linger
+    assert_fail
+    assert_err 'HOME is not set'
+}
+
 test_install_sh_non_linux() {
     setup
     export KILOADED_BIN_DIR="$CASE/user-bin"
@@ -742,6 +815,8 @@ run_case "fresh install" test_install_fresh
 run_case "idempotent install" test_install_idempotent
 run_case "pinned install versions" test_install_versions
 run_case "install verify failure" test_install_verify_failure
+run_case "install repairs broken current" test_install_repairs_broken_current
+run_case "corrupt config self-heals" test_corrupt_config
 run_case "update" test_update
 run_case "update rollback" test_update_rollback
 run_case "update before install" test_update_not_installed
@@ -759,8 +834,10 @@ run_case "logs" test_logs
 run_case "HOME and XDG paths with spaces" test_home_with_spaces
 run_case "existing kilo launcher" test_existing_launcher
 run_case "install --no-start" test_no_start
+run_case "install crash after start" test_install_crash_after_start
 run_case "update pinned version" test_update_pinned
 run_case "install.sh bootstrap" test_install_sh
+run_case "install.sh HOME unset with BIN_DIR" test_install_sh_home_unset
 run_case "install.sh non-Linux" test_install_sh_non_linux
 run_case "install.sh bad ref" test_install_sh_bad_ref
 run_case "systemd unit verifies" test_unit_verify

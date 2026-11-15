@@ -45,15 +45,15 @@ The manager honors `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XD
 - `$XDG_CONFIG_HOME/kiloaded/config` — the saved port and hostname.
 - `$XDG_CONFIG_HOME/systemd/user/kiloaded.service` — the unit.
 
-Kilo's own settings and credentials live under `~/.config/kilo` and `~/.local/share/kilo` (or the corresponding XDG overrides). Never write there during install, update, or remove. `remove` preserves those directories on purpose.
+Kilo's own settings and credentials live under `~/.config/kilo` and `~/.local/share/kilo` (or the corresponding XDG overrides). Never write there during install, update, or remove. `remove` preserves those directories on purpose. The manager's own config file is plain `KEY=value` text parsed line-by-line, never sourced; malformed values are ignored with a warning so `install` can rewrite a clean config instead of dying on a hand-mangled file.
 
 ### CLI isolation and atomic update
 
 The CLI is installed with `npm install --prefix <temp> @kilocode/cli@<spec>`, never with `npm install -g`. A global install would collide with the user's package manager and with an existing `kilo` command. The temp directory is created under the CLI store so the final move is on the same filesystem.
 
-The install flow is: npm into a temp directory, read the real version from the package's `package.json`, move the temp directory into `cli/<version>`, verify the binary with `--version`, then atomically swap the `current` symlink (`ln -s` to a temporary name and `mv -Tf`). If verification fails and the version directory was newly created, remove it and leave the old `current` untouched. `update` adds a service-level rollback: if the new version fails to start, relink the old version, rewrite the launcher, restart, and report the rollback.
+The install flow is: npm into a temp directory, read the real version from the package's `package.json`, verify the temp binary with `--version`, move the temp directory into `cli/<version>`, verify the final path, then atomically swap the `current` symlink (`ln -s` to a temporary name and `mv -Tf`). Every reuse path (current, exact cached version, or a cached version found after npm) also runs `verify_exec`; a broken current or cached directory is replaced instead of being reported as installed. If verification fails and the version directory was newly created, remove it and leave the old `current` untouched. `update` adds a service-level rollback: if the new version fails to start, relink the old version, rewrite the launcher, restart, and report the rollback.
 
-`update` prunes every non-current version only after the new service is active. That keeps one known-good version available until the restart actually succeeds. On a failed update the new version directory remains for debugging; do not prune in the failure path.
+`update` prunes every non-current version only after the new service is active. That keeps one known-good version available until the restart actually succeeds. `wait_active` requires the unit to stay active for a short stability window (default 3 seconds) after the first `is-active`, so a binary that crashes just after `exec` does not count as a successful update and cannot trigger the prune. On a failed update the new version directory remains for debugging; do not prune in the failure path.
 
 ### Stable wrapper, not a versioned ExecStart
 
@@ -95,7 +95,7 @@ The `kiloaded` command itself is installed by `install.sh`, not by the manager's
 
 `./tests/run.sh` is the default test command. It must stay fast, offline, and systemd-free. Every test starts from a fresh `HOME` and XDG tree under a temp directory, puts `tests/fakes` first on `PATH`, and uses `KILOADED_SYSTEMD_RUNTIME` to point the systemd check at a temp directory. The fake npm creates the exact `node_modules/@kilocode/cli` layout, including `bin/.kilo`, `bin/tree-sitter`, and a runnable `--version`; the fake systemctl records calls and can fail a selected call or fail a call once for rollback tests.
 
-The suite covers fresh install, idempotent install, pinned versions, update, update rollback, update-before-install, remove, `--keep-cli`, non-Linux rejection, missing systemd rejection, invalid flags, npm failure, systemctl failure, linger success/failure, status, logs, HOME/XDG paths with spaces, a pre-existing `kilo` launcher, `--no-start`, and pinned update. It also covers install verification failure, best-effort removal, foreign-unit protection, IPv6 URL formatting, the `install.sh` bootstrap, and `systemd-analyze verify` when that tool is available. When adding a lifecycle feature, add a test that asserts both the resulting files and the systemctl call order. When adding a failure mode, assert that the previous install is still usable and that no partial unit/current link is left behind.
+The suite covers fresh install, idempotent install, pinned versions, update, update rollback, update-before-install, remove, `--keep-cli`, non-Linux rejection, missing systemd rejection, invalid flags (including overlong ports), npm failure, systemctl failure, linger success/failure, status, logs, HOME/XDG paths with spaces, a pre-existing `kilo` launcher, `--no-start`, and pinned update. It also covers install verification failure, repair of a broken current install, corrupt-config recovery, crash-after-start detection, best-effort removal, foreign-unit protection, IPv6 URL formatting, the `install.sh` bootstrap (including HOME unset with `KILOADED_BIN_DIR`), and `systemd-analyze verify` when that tool is available. When adding a lifecycle feature, add a test that asserts both the resulting files and the systemctl call order. When adding a failure mode, assert that the previous install is still usable and that no partial unit/current link is left behind.
 
 `KEEP_TEST_DIR=1 ./tests/run.sh` keeps the temp trees and prints their path; the failure output dumps the manager's stdout/stderr and the fake command logs.
 
@@ -107,6 +107,7 @@ These environment variables exist for tests and unusual installations. Do not re
 - `KILOADED_SYSTEMCTL`, `KILOADED_LOGINCTL`, `KILOADED_JOURNALCTL` — absolute command paths.
 - `KILOADED_NPM`, `KILOADED_NODE` — absolute npm/node paths.
 - `KILOADED_BIN_DIR` — where `install.sh` and the `kilo` launcher live.
+- `KILOADED_STABLE_SECONDS` — post-start active-stability window (default 3; tests use 0).
 - `KILOADED_REF` — install.sh's raw GitHub ref, for testing a tag or branch.
 - `KILOADED_REAL`, `KILOADED_SMOKE_FROM`, `KILOADED_SMOKE_PORT` — smoke-test controls.
 
@@ -121,13 +122,15 @@ The smoke test uses fake systemctl/loginctl/journalctl because CI has no systemd
 Every shell change must pass:
 
 ```sh
-dash -n kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*
-bash -n kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*
+for f in kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*; do
+    dash -n "$f"
+    bash -n "$f"
+done
 shellcheck -s sh kiloaded install.sh tests/run.sh tests/smoke.sh tests/fakes/*
 ./tests/run.sh
 ```
 
-Shellcheck is enforced in CI. The only suppressions are `SC2016` for the literal `${KILO_TREE_SITTER_WASM_DIR:-}` text in the generated wrapper and `SC1090` for sourcing the generated config file. The `rm -rf "${CLI_ROOT:?}/..."` is a safety guard, not a suppression. Do not add blanket disables.
+Shellcheck is enforced in CI. The only intentional suppression is `SC2016` for the literal `${KILO_TREE_SITTER_WASM_DIR:-}` text in the generated wrapper. The `rm -rf "${CLI_ROOT:?}/..."` is a safety guard, not a suppression. Do not add blanket disables.
 
 ### CI
 
