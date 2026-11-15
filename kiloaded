@@ -7,11 +7,13 @@
 # directories and the Kilo CLI's own data.
 set -eu
 
-KILOADED_VERSION="0.1.0"
+KILOADED_VERSION="0.2.0"
 REPO="tweedge/kiloaded"
 SERVICE_NAME="kiloaded"
 DEFAULT_PORT="4096"
 DEFAULT_HOSTNAME="127.0.0.1"
+DEFAULT_REMOTE=1
+LOGIN_PROVIDER="kilo"
 NPM_PACKAGE="@kilocode/cli"
 SYSTEMD_RUNTIME="${KILOADED_SYSTEMD_RUNTIME:-/run/systemd/system}"
 
@@ -28,6 +30,7 @@ Usage: kiloaded <command> [options]
 
 Commands:
   install [options]   Install the Kilo CLI and the systemd --user service
+  login               Log in to Kilo (prints a device code URL to open anywhere)
   update [options]    Update the Kilo CLI and restart the service
   remove [options]    Stop and remove the service (and the CLI by default)
   status              Show what is installed and whether it is running
@@ -38,6 +41,8 @@ Install options:
   --version VERSION   Kilo CLI version to install (default: latest)
   --port PORT         Port for `kilo serve` (default: 4096)
   --hostname HOST     Address for `kilo serve` (default: 127.0.0.1)
+  --no-remote         Do not register with Kilo Cloud (remote control is on by
+                      default and re-enabled after every service start)
   --no-start          Install and enable, but do not start the service now
   --no-linger         Do not enable login lingering (service starts at login)
 
@@ -48,7 +53,9 @@ Remove options:
   --keep-cli          Keep the downloaded Kilo CLI and `kilo` launcher
 
 Run as the user who should own the service. kiloaded is Linux-only and needs
-systemd user services plus Node.js/npm for install and update.
+systemd user services plus Node.js/npm for install and update. Remote control
+uses curl to call the local server after each start; `kilo auth login` uses a
+device code you can open from any browser, including your phone.
 EOF
 }
 
@@ -101,6 +108,7 @@ init_paths() {
     CLI_ROOT="$DATA_ROOT/cli"
     CURRENT_LINK="$CLI_ROOT/current"
     LIBEXEC="$DATA_ROOT/libexec/kilo"
+    LIBEXEC_REMOTE="$DATA_ROOT/libexec/kilo-remote"
     CONFIG_FILE="$CONFIG_ROOT/config"
     BIN_DIR="${KILOADED_BIN_DIR:-$HOME/.local/bin}"
     LAUNCHER="$BIN_DIR/kilo"
@@ -423,6 +431,159 @@ install_launcher() {
 }
 
 # ---------------------------------------------------------------------------
+# Kilo login and remote control
+# ---------------------------------------------------------------------------
+
+# kilo_logged_in: 0 = logged in, 1 = not logged in, 2 = could not tell.
+# `kilo profile` exits non-zero with "Not authenticated with Kilo Gateway"
+# when there is no Kilo account credential; other failures (offline, API
+# trouble) are treated as unknown so they never trigger a login flow.
+kilo_logged_in() {
+    if _login_out=$("$LIBEXEC" profile 2>&1); then
+        return 0
+    fi
+    case "$_login_out" in
+        *"Not authenticated"*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# login_command runs `kilo auth login` for the Kilo Gateway. The login is a
+# device-code flow: the CLI prints a URL and code that can be opened from any
+# browser, then polls until the user approves. Returns 2 when there is no
+# terminal to attach the flow to. KILOADED_TTY forces the stdin used for the
+# flow (tests); set it to an empty string to force the non-interactive path.
+login_command() {
+    if [ -t 0 ]; then
+        "$LIBEXEC" auth login -p "$LOGIN_PROVIDER"
+    elif [ "${KILOADED_TTY+Y}" = "Y" ] && [ -n "$KILOADED_TTY" ]; then
+        "$LIBEXEC" auth login -p "$LOGIN_PROVIDER" <"$KILOADED_TTY"
+    elif [ "${KILOADED_TTY+Y}" != "Y" ] && ( : </dev/tty ) 2>/dev/null; then
+        "$LIBEXEC" auth login -p "$LOGIN_PROVIDER" </dev/tty
+    else
+        return 2
+    fi
+}
+
+# Best-effort: install/update must not fail when the user skips or cannot
+# complete the login (the service still runs; remote control just warns).
+ensure_logged_in() {
+    _login_state=0
+    kilo_logged_in || _login_state=$?
+    case "$_login_state" in
+        0) return 0 ;;
+        2)
+            warn "could not check the Kilo login status; continuing without logging in"
+            return 0
+            ;;
+    esac
+    say "not logged in to Kilo; starting login (open the printed URL on any device)..."
+    _login_rc=0
+    login_command || _login_rc=$?
+    if [ "$_login_rc" = "2" ]; then
+        warn "no interactive terminal for login; run 'kiloaded login' from a terminal"
+        return 0
+    fi
+    if [ "$_login_rc" != "0" ]; then
+        warn "login was not completed; run 'kiloaded login' to try again"
+        return 0
+    fi
+    if kilo_logged_in; then
+        say "logged in to Kilo"
+    else
+        warn "login did not complete; run 'kiloaded login' to try again"
+    fi
+    return 0
+}
+
+# Remote control is registered by POSTing /remote/enable on the local server.
+# The unit calls the generated helper as ExecStartPost after every start, so
+# the relay survives restarts and reboots without a login session. An env-var
+# config key (remote_control) would also enable it, but the manager never
+# edits Kilo's own files, and the config key alone does not open the relay on
+# an idle headless server; the explicit POST does.
+write_remote_helper() {
+    HELPER_READY=0
+    if [ "$REMOTE" != "1" ]; then
+        rm -f "$LIBEXEC_REMOTE"
+        return 0
+    fi
+    # KILOADED_CURL set to an empty string simulates "curl is missing" in tests.
+    if [ "${KILOADED_CURL+Y}" = "Y" ]; then
+        _remote_curl="$KILOADED_CURL"
+    else
+        _remote_curl=$(command -v curl 2>/dev/null || true)
+    fi
+    if [ -z "$_remote_curl" ]; then
+        warn "curl was not found; remote control will not be enabled (install curl and re-run install)"
+        rm -f "$LIBEXEC_REMOTE"
+        return 0
+    fi
+    _remote_url="$(format_url "$HOSTNAME" "$PORT")/remote/enable"
+    _helper_tmp="$LIBEXEC_REMOTE.tmp.$$"
+    {
+        printf '#!/bin/sh\n'
+        printf '# Generated by kiloaded. Re-run install or update instead of editing.\n'
+        printf '# Enables the remote-control relay on the local kilo server (Kilo Cloud).\n'
+        printf '# Best-effort ExecStartPost: it always exits 0 so it can never fail the\n'
+        printf '# unit, even when curl is missing or the server is slow to listen.\n'
+        printf 'URL=%s\n' "$(shell_quote "$_remote_url")"
+        printf 'CURL_DEFAULT=%s\n' "$(shell_quote "$_remote_curl")"
+        cat <<'EOF'
+
+CURL_BIN="${KILOADED_CURL:-}"
+if [ -z "$CURL_BIN" ]; then
+    CURL_BIN="$CURL_DEFAULT"
+    if [ -n "$CURL_BIN" ] && [ ! -x "$CURL_BIN" ]; then
+        CURL_BIN=$(command -v curl 2>/dev/null || true)
+    fi
+fi
+if [ -z "$CURL_BIN" ]; then
+    printf '%s\n' 'kiloaded: warning: curl was not found; remote control was not enabled' >&2
+    exit 0
+fi
+
+tries="${KILOADED_REMOTE_TRIES:-8}"
+case "$tries" in
+    '' | *[!0-9]*) tries=8 ;;
+esac
+interval="${KILOADED_REMOTE_INTERVAL:-1}"
+case "$interval" in
+    '' | *[!0-9]*) interval=1 ;;
+esac
+
+# The server's HTTP API is protected by HTTP Basic auth when
+# KILO_SERVER_PASSWORD is set (username: KILO_SERVER_USERNAME or "kilo").
+# Drop-in environment variables reach ExecStartPost, so the password is read
+# from the environment at runtime and never written into generated files.
+if [ -n "${KILO_SERVER_PASSWORD:-}" ]; then
+    set -- -u "${KILO_SERVER_USERNAME:-kilo}:${KILO_SERVER_PASSWORD}"
+else
+    set --
+fi
+
+i=0
+while [ "$i" -lt "$tries" ]; do
+    if "$CURL_BIN" -fsS -m 2 -o /dev/null -X POST "$URL" "$@" >/dev/null 2>&1; then
+        exit 0
+    fi
+    i=$((i + 1))
+    if [ "$i" -lt "$tries" ]; then
+        sleep "$interval"
+    fi
+done
+
+printf '%s\n' "kiloaded: warning: could not enable remote control after $tries attempts (server: $URL)" >&2
+exit 0
+EOF
+    } >"$_helper_tmp"
+    chmod 700 "$_helper_tmp"
+    mv -f "$_helper_tmp" "$LIBEXEC_REMOTE"
+    HELPER_READY=1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Config and unit rendering
 # ---------------------------------------------------------------------------
 
@@ -432,6 +593,7 @@ write_config() {
         printf '# Generated by kiloaded. Re-run install with new options instead of editing.\n'
         printf 'KILOADED_PORT=%s\n' "$PORT"
         printf 'KILOADED_HOSTNAME=%s\n' "$HOSTNAME"
+        printf 'KILOADED_REMOTE=%s\n' "$REMOTE"
     } >"$_config_tmp"
     chmod 600 "$_config_tmp"
     mv -f "$_config_tmp" "$CONFIG_FILE"
@@ -440,14 +602,17 @@ write_config() {
 load_config() {
     PORT="$DEFAULT_PORT"
     HOSTNAME="$DEFAULT_HOSTNAME"
+    REMOTE="$DEFAULT_REMOTE"
     [ -f "$CONFIG_FILE" ] || return 0
 
     _config_port=""
     _config_hostname=""
+    _config_remote=""
     while IFS= read -r _config_line || [ -n "$_config_line" ]; do
         case "$_config_line" in
             KILOADED_PORT=*) _config_port="${_config_line#KILOADED_PORT=}" ;;
             KILOADED_HOSTNAME=*) _config_hostname="${_config_line#KILOADED_HOSTNAME=}" ;;
+            KILOADED_REMOTE=*) _config_remote="${_config_line#KILOADED_REMOTE=}" ;;
         esac
     done <"$CONFIG_FILE"
 
@@ -464,6 +629,12 @@ load_config() {
         else
             warn "ignoring invalid hostname in $CONFIG_FILE"
         fi
+    fi
+    if [ -n "$_config_remote" ]; then
+        case "$_config_remote" in
+            0 | 1) REMOTE="$_config_remote" ;;
+            *) warn "ignoring invalid remote setting in $CONFIG_FILE" ;;
+        esac
     fi
 }
 
@@ -505,6 +676,12 @@ render_unit() {
         "$(systemd_quote "$LIBEXEC")" \
         "$(systemd_quote "$HOSTNAME")" \
         "$(systemd_quote "$PORT")"
+    if [ "$REMOTE" = "1" ] && [ "$HELPER_READY" = "1" ]; then
+        printf '%s\n' '# ExecStartPost registers the server with Kilo Cloud (remote control)'
+        printf '%s\n' '# after every start. Best-effort: the helper exits 0 even when it'
+        printf '%s\n' '# fails, so it can never block or fail the service.'
+        printf 'ExecStartPost=%s\n' "$(systemd_quote "$LIBEXEC_REMOTE")"
+    fi
     printf 'Restart=on-failure\n'
     printf 'RestartSec=5\n'
     printf 'TimeoutStopSec=20\n'
@@ -625,12 +802,46 @@ format_url() {
     esac
 }
 
+# Queries the running server's remote-control state. Best-effort: any failure
+# (curl missing, server not answering) prints "remote: unknown".
+print_remote_status() {
+    _remote_curl="${KILOADED_CURL:-}"
+    if [ -z "$_remote_curl" ]; then
+        _remote_curl=$(command -v curl 2>/dev/null || true)
+    fi
+    if [ -z "$_remote_curl" ]; then
+        printf 'remote: unknown\n'
+        return 0
+    fi
+    _remote_out=$("$_remote_curl" -fsS -m 5 "$(format_url "$HOSTNAME" "$PORT")/remote/status" 2>/dev/null || true)
+    if printf '%s\n' "$_remote_out" | grep -q '"enabled"[[:space:]]*:[[:space:]]*true'; then
+        if printf '%s\n' "$_remote_out" | grep -q '"connected"[[:space:]]*:[[:space:]]*true'; then
+            printf 'remote: enabled (connected)\n'
+        else
+            printf 'remote: enabled (not connected)\n'
+        fi
+    elif printf '%s\n' "$_remote_out" | grep -q '"enabled"'; then
+        printf 'remote: disabled\n'
+    else
+        printf 'remote: unknown\n'
+    fi
+    return 0
+}
+
 print_summary() {
     _version=$(current_version || printf 'unknown')
     say "Kilo CLI: $_version"
     say "service: $SERVICE_NAME.service (systemd --user)"
     say "unit: $UNIT_PATH"
     say "url: $(format_url "$HOSTNAME" "$PORT")"
+    if [ "$REMOTE" = "1" ] && [ "$HELPER_READY" = "1" ]; then
+        say "remote control: enabled (registers with Kilo Cloud after every start)"
+    elif [ "$REMOTE" = "1" ]; then
+        say "remote control: enabled, but curl is missing so it will not be registered"
+        say "install curl and re-run 'kiloaded install' to finish setup"
+    else
+        say "remote control: disabled"
+    fi
     say "logs: kiloaded logs -f"
 }
 
@@ -642,6 +853,7 @@ cmd_install() {
     OPT_VERSION="latest"
     OPT_PORT=""
     OPT_HOSTNAME=""
+    OPT_REMOTE=""
     START=1
     LINGER=1
 
@@ -672,6 +884,14 @@ cmd_install() {
                 ;;
             --hostname=*)
                 OPT_HOSTNAME="${1#--hostname=}"
+                shift
+                ;;
+            --remote)
+                OPT_REMOTE=1
+                shift
+                ;;
+            --no-remote)
+                OPT_REMOTE=0
                 shift
                 ;;
             --no-start)
@@ -714,6 +934,9 @@ cmd_install() {
     if [ -n "$OPT_HOSTNAME" ]; then
         HOSTNAME="$OPT_HOSTNAME"
     fi
+    if [ -n "$OPT_REMOTE" ]; then
+        REMOTE="$OPT_REMOTE"
+    fi
     validate_port "$PORT"
     validate_hostname "$HOSTNAME"
     warn_non_loopback "$HOSTNAME"
@@ -722,6 +945,8 @@ cmd_install() {
     write_config
     write_launcher
     install_launcher
+    ensure_logged_in
+    write_remote_helper
     write_unit
     start_service "$START"
     enable_linger
@@ -775,6 +1000,8 @@ cmd_update() {
     [ -n "$_new" ] || die "update finished but no current Kilo CLI is linked"
 
     write_launcher
+    ensure_logged_in
+    write_remote_helper
     write_unit
 
     if ! restart_service; then
@@ -879,6 +1106,34 @@ cmd_remove() {
     say "Kilo settings and authentication in ~/.config/kilo were not touched"
 }
 
+cmd_login() {
+    init_paths
+    check_linux
+    [ -x "$LIBEXEC" ] || die "kiloaded is not installed; run 'kiloaded install' first"
+
+    if kilo_logged_in; then
+        say "already logged in to Kilo:"
+        "$LIBEXEC" profile || true
+        return 0
+    fi
+
+    say "starting Kilo login (open the printed URL on any device)..."
+    _login_rc=0
+    login_command || _login_rc=$?
+    if [ "$_login_rc" = "2" ]; then
+        die "no interactive terminal for login; run 'kiloaded login' from a terminal session"
+    fi
+    if [ "$_login_rc" != "0" ]; then
+        die "login was not completed; run 'kiloaded login' to try again"
+    fi
+    if kilo_logged_in; then
+        say "logged in to Kilo"
+        "$LIBEXEC" profile || true
+    else
+        die "login did not complete; run 'kiloaded login' to try again"
+    fi
+}
+
 cmd_status() {
     init_paths
     check_linux
@@ -900,6 +1155,7 @@ cmd_status() {
     printf 'unit: %s\n' "$UNIT_PATH"
 
     _systemctl=$(command -v systemctl 2>/dev/null || true)
+    _active="unknown"
     if [ -n "$_systemctl" ] && [ -d "$SYSTEMD_RUNTIME" ]; then
         if "$_systemctl" --user is-enabled --quiet "$SERVICE_NAME.service" >/dev/null 2>&1; then
             printf 'enabled: yes\n'
@@ -908,8 +1164,10 @@ cmd_status() {
         fi
         if "$_systemctl" --user is-active --quiet "$SERVICE_NAME.service" >/dev/null 2>&1; then
             printf 'active: yes\n'
+            _active="yes"
         else
             printf 'active: no\n'
+            _active="no"
         fi
     else
         printf 'service state: unknown (systemctl unavailable)\n'
@@ -918,6 +1176,10 @@ cmd_status() {
     if [ -f "$CONFIG_FILE" ]; then
         load_config
         printf 'url: %s\n' "$(format_url "$HOSTNAME" "$PORT")"
+        case "$_active" in
+            yes) print_remote_status ;;
+            *) printf 'remote: unknown (service not running)\n' ;;
+        esac
     fi
 
     _loginctl=$(command -v loginctl 2>/dev/null || true)
@@ -963,6 +1225,7 @@ shift
 
 case "$_command" in
     install) cmd_install "$@" ;;
+    login) cmd_login "$@" ;;
     update) cmd_update "$@" ;;
     remove | uninstall) cmd_remove "$@" ;;
     status) cmd_status "$@" ;;
